@@ -17,7 +17,11 @@ use blueos_hal::PlatPeri;
 
 use crate::devices::bus::{BusInterface, BusWrapper};
 
-const DEFAULT_I2C_BAUDRATE: u32 = 400_000;
+// 100 kHz: the AXP2101 PMIC is the only device on I2C0, and the reference
+// firmware (01_AXP2101_Test) drives it at 100 kHz. 400 kHz caused the very
+// first read_register to fail (NACK) on this board. Revisit if a Fast-mode
+// device (e.g. FT6336U touch) is added to this bus later.
+const DEFAULT_I2C_BAUDRATE: u32 = 100_000;
 
 pub struct BlockI2c<T: PlatPeri> {
     inner: &'static T,
@@ -26,7 +30,6 @@ pub struct BlockI2c<T: PlatPeri> {
 impl<T: blueos_hal::i2c::I2c<I2cConfig, ()>> BlockI2c<T> {
     pub fn new(inner: &'static T) -> Result<Self, blueos_hal::err::HalError> {
         inner.configure(&I2cConfig {
-            // FT6336U supports Fast-mode; use it to keep touch polling latency low.
             baudrate: DEFAULT_I2C_BAUDRATE,
         })?;
         Ok(BlockI2c { inner })
@@ -37,7 +40,12 @@ impl<T: blueos_hal::i2c::I2c<I2cConfig, ()>> BlockI2c<T> {
         operation: &str,
         error: blueos_hal::err::HalError,
     ) -> crate::error::Error {
-        log::warn!(
+        // kearly_println, not log::warn!: I2C init runs from init_spi_bus()
+        // (boot.rs:119) BEFORE logger_init (boot.rs:128), so log::warn! is
+        // silently dropped and the failure looks like a bare Error(-5) on
+        // serial. The raw int_raw status below distinguishes NACK (bit10)
+        // from Timeout (bit8/13/14) so the AXP2101 failure is diagnosable.
+        crate::kearly_println!(
             "I2C {} failed: {:?}, controller error status: 0x{:08x}",
             operation,
             error,

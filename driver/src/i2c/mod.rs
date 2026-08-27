@@ -14,7 +14,7 @@
 
 pub mod i2c_dw;
 
-#[cfg(soc_esp32c3)]
+#[cfg(any(soc_esp32c3, soc_esp32c6))]
 pub mod esp32_i2c;
 
 pub struct I2cConfig {

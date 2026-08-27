@@ -64,27 +64,34 @@ run_clippy("esp_radio_sys_unittest_clippy") {
   deps = [ ":esp_radio_sys_unittest" ]
 }
 
-gen_esp32_qemu_runner("esp_radio_sys_unittest_runner") {
-  testonly = true
-  elf = ":esp_radio_sys_unittest"
-  chip = "${chip}"
-  bootloader = qemu_esp32_bootloader_bin
-  partition_table = qemu_esp32_partition_table_bin
-  qemu = qemu_exe
-  machine = qemu_machine
-  qemu_args = qemu_extra_args
-  net_args = qemu_net_args
-  block_args = qemu_block_args
-  semihosting = true
-}
+# The esp32 QEMU runner only applies to chips that ship an esp32 image loader
+# (seeed_xiao_esp32c3 sets qemu_use_esp32_loader=true). ESP32-C6 has no usable
+# QEMU — upstream QEMU lacks an esp32c6 machine and the qemu-esp32 fork only
+# supports esp32c3 — so the runner + check targets are gated out entirely on
+# C6. Same switch as kernel/kernel/BUILD.gn:197.
+if (defined(qemu_use_esp32_loader) && qemu_use_esp32_loader) {
+  gen_esp32_qemu_runner("esp_radio_sys_unittest_runner") {
+    testonly = true
+    elf = ":esp_radio_sys_unittest"
+    chip = "${chip}"
+    bootloader = qemu_esp32_bootloader_bin
+    partition_table = qemu_esp32_partition_table_bin
+    qemu = qemu_exe
+    machine = qemu_machine
+    qemu_args = qemu_extra_args
+    net_args = qemu_net_args
+    block_args = qemu_block_args
+    semihosting = true
+  }
 
-run_qemu_check("run_esp_radio_sys_unittest") {
-  testonly = true
-  runner = ":esp_radio_sys_unittest_runner"
-  if (coverage) {
-    img = ":esp_radio_sys_unittest"
-    checker = "//kernel/adapter/coverage.checker"
-  } else {
-    checker = "//kernel/adapter/unittests.checker"
+  run_qemu_check("run_esp_radio_sys_unittest") {
+    testonly = true
+    runner = ":esp_radio_sys_unittest_runner"
+    if (coverage) {
+      img = ":esp_radio_sys_unittest"
+      checker = "//kernel/adapter/coverage.checker"
+    } else {
+      checker = "//kernel/adapter/unittests.checker"
+    }
   }
 }

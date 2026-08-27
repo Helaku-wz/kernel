@@ -16,5 +16,5 @@ pub mod gd32_af;
 pub mod gd32_afio;
 pub mod rpi_pico;
 
-#[cfg(soc_esp32c3)]
+#[cfg(any(soc_esp32c3, soc_esp32c6))]
 pub mod esp32_pinctrl;

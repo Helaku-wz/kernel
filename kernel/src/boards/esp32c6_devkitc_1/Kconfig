@@ -24,5 +24,47 @@ config SOC_ESP32C6
     select RISCV
     select HAS_MIE
 
+config LCD
+    bool "Enable LCD device"
+    default n
+    select SPI_CORE
+    select AXP2101
+    help
+      Enable LCD module. Selects SPI_CORE because the CO5300 QSPI LCD
+      driver talks to the panel through BlockSpi, and AXP2101 because the
+      AMOLED panel's power/reset is controlled by the AXP2101 PMIC ALDO3
+      (the panel RST line is NC; reset is done by power-cycling ALDO3).
+
+config AXP2101
+    bool "Enable AXP2101 PMIC driver"
+    default n
+    select I2C_CORE
+    select USE_EMBEDDED_HAL_V1
+    help
+      Enable the X-Powers AXP2101 PMIC driver over I2C. Selects I2C_CORE
+      (so init_i2c_bus runs and the BlockI2c embedded-hal I2c impl is
+      compiled) and USE_EMBEDDED_HAL_V1 (the AXP2101 driver talks to the
+      bus through the embedded-hal 1.0 I2c trait).
+
+if LCD
+
+  choice
+    prompt "LCD controller"
+    default CO5300
+
+    config CO5300
+        bool "Enable LCD CO5300"
+        help
+          Enable the ChipOne CO5300 AMOLED (480x480, QSPI 4-wire, no D/CX).
+  endchoice
+
+endif
+
+config USE_EMBEDDED_HAL_V1
+    bool "Impl embedded-hal-1.0.0 for driver"
+    default y
+    help
+      Impl embedded-hal-1.0.0 for driver
+
 config NUM_IRQS
     default 31

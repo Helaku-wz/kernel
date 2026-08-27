@@ -64,6 +64,32 @@ impl<T: blueos_hal::spi::Spi<SpiConfig, ()>, G: blueos_hal::gpio::OutputPin> Blo
     }
 }
 
+// QSPI forwarding. Available only when the inner peripheral implements Qspi
+// (e.g. ESP32 GPSPI2). CS is NOT managed here — the caller (QSPI LCD driver)
+// holds CS low across command + pixel stream via assert_cs/deassert_cs, so a
+// single CS-low window spans the whole CASET+RASET+RAMWR+pixel sequence.
+impl<T: blueos_hal::spi::Spi<SpiConfig, ()> + blueos_driver::spi::Qspi, G: blueos_hal::gpio::OutputPin>
+    BlockSpi<T, G>
+{
+    pub fn qspi_write_command(&self, cmd: u8, params: &[u8]) -> Result<(), crate::error::Error> {
+        self.inner
+            .qspi_write_command(cmd, params)
+            .map_err(|_| crate::error::code::EIO)
+    }
+
+    pub fn qspi_write_pixels(&self, pixels: &[u8]) -> Result<(), crate::error::Error> {
+        self.inner
+            .qspi_write_pixels(pixels)
+            .map_err(|_| crate::error::code::EIO)
+    }
+
+    pub fn qspi_read_command(&self, cmd: u8, buf: &mut [u8]) -> Result<(), crate::error::Error> {
+        self.inner
+            .qspi_read_command(cmd, buf)
+            .map_err(|_| crate::error::code::EIO)
+    }
+}
+
 impl<T: blueos_hal::spi::Spi<SpiConfig, ()>, G: blueos_hal::gpio::OutputPin> BusInterface
     for BlockSpi<T, G>
 {

@@ -22,6 +22,8 @@ pub(crate) mod input;
 #[cfg(lcd)]
 pub(crate) mod lcd;
 pub(crate) mod msip;
+#[cfg(axp2101)]
+pub(crate) mod pmic;
 pub(crate) mod sensor;
 pub(crate) mod serial;
 pub(crate) mod timer;

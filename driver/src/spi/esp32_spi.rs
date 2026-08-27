@@ -30,6 +30,24 @@ const EMPTY_WRITE_PAD: u8 = 0x00;
 // Command bits are hardware-owned and must clear before the next operation.
 const SPI_CMD_TIMEOUT: usize = 10_000;
 
+// Diagnostic counters: how many times start_transfer / wait_done ran their
+// busy-wait to the SPI_CMD_TIMEOUT cap without the expected bit clearing.
+// Non-zero means SPI transactions are not completing -- the USR bit never
+// self-cleared (start_transfer) or TRANS_DONE never asserted (wait_done). The
+// CO5300 init() path swallows wait_done timeouts via .ok(), so without these
+// counters the only symptom is "init takes very long then prints Ok" or hangs
+// silently. Boards init reads these back via kearly_println to localize the
+// fault from serial output alone.
+static USR_TIMEOUTS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static TRANS_DONE_TIMEOUTS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn spi_diag_timeouts() -> (usize, usize) {
+    (
+        USR_TIMEOUTS.load(core::sync::atomic::Ordering::Relaxed),
+        TRANS_DONE_TIMEOUTS.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 fn wait_until_clear(
     mut is_set: impl FnMut() -> bool,
     max_polls: usize,
@@ -52,6 +70,15 @@ register_bitfields! [
     ],
 
     pub CTRL [
+        // Quad/Dual phase width controls. C3 and C6 share identical bit positions.
+        // Address/command phase widths live in CTRL; write-data width lives in USER (FWRITE_*).
+        FADDR_DUAL OFFSET(5) NUMBITS(1) [],
+        FADDR_QUAD OFFSET(6) NUMBITS(1) [],
+        FCMD_DUAL OFFSET(8) NUMBITS(1) [],
+        FCMD_QUAD OFFSET(9) NUMBITS(1) [],
+        FREAD_DUAL OFFSET(14) NUMBITS(1) [],
+        FREAD_QUAD OFFSET(15) NUMBITS(1) [],
+        // C3: 1-bit; C6: 2-bit (bits 23:24 / 25:26). Low bit semantics identical (0=MSB).
         RD_BIT_ORDER OFFSET(25) NUMBITS(1) [
             MsbFirst = 0,
             LsbFirst = 1,
@@ -75,6 +102,9 @@ register_bitfields! [
             HalfDuplex = 0,
             FullDuplex = 1,
         ],
+        // Write-data phase width. Quad write (0x32 pixel stream) sets FWRITE_QUAD.
+        FWRITE_DUAL OFFSET(12) NUMBITS(1) [],
+        FWRITE_QUAD OFFSET(13) NUMBITS(1) [],
         CK_OUT_EDGE OFFSET(9) NUMBITS(1) [
             LeadingEdge = 0,
             TrailingEdge = 1,
@@ -179,6 +209,33 @@ register_bitfields! [
             Reset = 1,
         ],
     ],
+
+    // C6 PCR `spi2_conf` register (at PCR base + 0xC0).
+    // NOTE the inverted reset polarity vs C3: RST_EN 0=reset, 1=de-reset.
+    pub PCR_SPI2_CONF [
+        SPI2_CLK_EN OFFSET(0) NUMBITS(1) [
+            Enabled = 1,
+            Disabled = 0,
+        ],
+        SPI2_RST_EN OFFSET(1) NUMBITS(1) [
+            Reset = 0,
+            NoReset = 1,
+        ],
+    ],
+
+    // C6 PCR `spi2_clkm_conf` register (at PCR base + 0xC4).
+    // No clkm_div_num field exposed in PAC 0.23; div_num stays at reset 0 (passthrough).
+    pub PCR_SPI2_CLKM_CONF [
+        SPI2_CLKM_SEL OFFSET(20) NUMBITS(2) [
+            Xtal = 0,
+            Pll80M = 1,
+            Fosc = 2,
+        ],
+        SPI2_CLKM_EN OFFSET(22) NUMBITS(1) [
+            Enabled = 1,
+            Disabled = 0,
+        ],
+    ],
 ];
 
 register_structs! {
@@ -227,6 +284,9 @@ register_structs! {
 }
 
 // System registers for SPI2 clock gating and reset.
+// C3: SYSTEM peripheral (perip_clk_en0 @ +0x10, perip_rst_en0 @ +0x18, bit6).
+// C6: PCR peripheral (spi2_conf @ +0xC0, spi2_clkm_conf @ +0xC4).
+#[cfg(soc_esp32c3)]
 register_structs! {
     SystemRegisters {
         (0x00 => _reserved_sys0),
@@ -234,6 +294,16 @@ register_structs! {
         (0x14 => _reserved_sys1),
         (0x18 => perip_rst_en0: ReadWrite<u32, PERIP_RST_EN0::Register>),
         (0x1C => @END),
+    }
+}
+
+#[cfg(soc_esp32c6)]
+register_structs! {
+    SystemRegisters {
+        (0x00 => _reserved_sys0),
+        (0xC0 => spi2_conf: ReadWrite<u32, PCR_SPI2_CONF::Register>),
+        (0xC4 => spi2_clkm_conf: ReadWrite<u32, PCR_SPI2_CLKM_CONF::Register>),
+        (0xC8 => @END),
     }
 }
 
@@ -358,11 +428,37 @@ impl<const SPI_BASE: usize, const SYS_BASE: usize, const APB_HZ: u32>
         wait_until_clear(|| regs.cmd.is_set(CMD::UPDATE), SPI_CMD_TIMEOUT)?;
         regs.dma_int_clr.write(DMA_INT_CLR::TRANS_DONE::SET);
         regs.cmd.modify(CMD::USR.val(1));
-        wait_until_clear(|| regs.cmd.is_set(CMD::USR), SPI_CMD_TIMEOUT)
+        let res = wait_until_clear(|| regs.cmd.is_set(CMD::USR), SPI_CMD_TIMEOUT);
+        if res.is_err() {
+            // USR never self-cleared: the peripheral never accepted the USER
+            // command. Usually means the SPI function clock is off, the
+            // peripheral is held in reset, or MS_DLEN is misconfigured.
+            USR_TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        res
     }
 
     fn wait_done(&self) {
-        // No DMA in use; with DMA, poll dma_int_raw TRANS_DONE then clear it via dma_int_clr.
+        // The USR bit self-clears when the USER transaction is *accepted*, but the
+        // SPI peripheral is still shifting data out of the TX FIFO at that point.
+        // ESP-IDF's spi_device_polling_transmit waits on the TRANS_DONE interrupt
+        // (dma_int_raw bit12), which asserts only after the last bit has left the
+        // shift register. Without this, back-to-back USER transactions (header
+        // then data chunks in do_qspi_write) race: the next reset_tx_fifo can
+        // purge the still-shifting bytes, silently truncating the transfer. Poll
+        // TRANS_DONE here so a subsequent FIFO reset / next USR is always safe.
+        //
+        // C6 note: dma_int_raw.trans_done (bit12) is R/WTC/SS -- hardware sets it
+        // on transaction completion independent of dma_int_ena (which only gates
+        // the CPU interrupt). So if this poll times out, the transaction never
+        // completed: the SPI clock/CS/quad-mode config is wrong, not the int_ena.
+        let regs = Self::spi_regs();
+        let res =
+            wait_until_clear(|| !regs.dma_int_raw.is_set(DMA_INT_RAW::TRANS_DONE), SPI_CMD_TIMEOUT);
+        if res.is_err() {
+            TRANS_DONE_TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        regs.dma_int_clr.write(DMA_INT_CLR::TRANS_DONE::SET);
     }
 
     fn configure_clock(&self, baudrate: u32) -> blueos_hal::err::Result<()> {
@@ -523,6 +619,165 @@ impl<const SPI_BASE: usize, const SYS_BASE: usize, const APB_HZ: u32>
         }
         Ok(())
     }
+
+    // --- QSPI support ---
+
+    // QSPI command header format (CO5300/SH8601 "no D/CX" QSPI panels).
+    // CO5300 datasheet p20 (5.2 QUAD SPI Interface) defines command-write as:
+    //   Instruction[7:0] = 0x02                       (1st bus byte)
+    //   AD[23:0]       = {8'h00, CMD[7:0], 8'h00}     (next 3 bus bytes)
+    //   PAM[7:0]       = parameters                    (following bytes)
+    // so the panel expects the 4-byte header on the bus as:
+    //   [0x02, 0x00, CMD, 0x00]   -- CMD sits at byte index 2, NOT index 1.
+    //
+    // ESP32 SPI shifts the data buffer out low-address-byte first, so the
+    // in-memory buffer must already be in bus order: [opcode, 0x00, cmd, 0x00].
+    // This matches what ESP-IDF esp_lcd `tx_param` actually puts on the wire:
+    // it forms the 32-bit value 0x0200_<cmd>_00 (e.g. Set_Backlight builds
+    // 0x02005100), stores it little-endian as [0x00, <cmd>, 0x00, 0x02], then
+    // spi_lcd_prepare_cmd_buffer reverses the whole 4-byte run (because
+    // lcd_cmd_bits=32 > 8) to [0x02, 0x00, <cmd>, 0x00] before the hardware
+    // shifts it out. The LE-store + reverse compose to land CMD at index 2.
+    // We write the final bus order directly, skipping both steps.
+    //
+    // Framing is split across two USER transactions held under one CS-low span:
+    //   (1) 4-byte header  -> 1-wire (FWRITE_QUAD=0), USR_MOSI only.
+    //   (2) payload/pixels -> quad (FWRITE_QUAD=1) for pixel writes, else 1-wire.
+    // This matches esp_lcd: command phase is always 1-wire; only the data
+    // phase of a tx_color (0x32) goes 4-wire.
+    const QSPI_HEADER_LEN: usize = 4;
+
+    // Build the 4-byte command header in bus order (opcode first, CMD at idx 2).
+    // See the format block above for the datasheet/ESP-IDF derivation.
+    fn qspi_header(&self, opcode: u8, cmd_code: u8) -> [u8; 4] {
+        [opcode, 0x00, cmd_code, 0x00]
+    }
+
+    // Send the 4-byte command header as a standalone 1-wire MOSI transaction.
+    // CS is assumed held low by the caller across this and the following data
+    // transaction. USR_COMMAND/USR_ADDR stay CLEAR: the header is plain data.
+    fn qspi_send_header(&self, opcode: u8, cmd_code: u8) -> blueos_hal::err::Result<()> {
+        let regs = Self::spi_regs();
+        let header = self.qspi_header(opcode, cmd_code);
+        regs.user.modify(
+            USER::DOUTDIN.val(0)
+                + USER::USR_MOSI::SET
+                + USER::USR_MISO::CLEAR
+                + USER::USR_COMMAND::CLEAR
+                + USER::USR_ADDR::CLEAR
+                + USER::USR_DUMMY::CLEAR
+                + USER::FWRITE_QUAD.val(0),
+        );
+        self.reset_tx_fifo();
+        regs.ms_dlen
+            .write(MS_DLEN::MS_DATA_BITLEN.val((Self::QSPI_HEADER_LEN as u32 * 8 - 1)));
+        self.write_buf(&header);
+        self.start_transfer()?;
+        self.wait_done();
+        Ok(())
+    }
+
+    // QSPI write: 4-byte header [opcode, cmd, 0,0] (1-wire) then payload data.
+    // `quad_data` selects 4-wire (FWRITE_QUAD=1, pixel stream via 0x32) vs
+    // 1-wire for the data phase; the header phase is always 1-wire. CS is held
+    // low by the caller across header + all data chunks. Large data is chunked
+    // to SPI2_DATA_BUF_SIZE; the header is sent in its own transaction first.
+    fn do_qspi_write(
+        &self,
+        opcode: u8,
+        cmd_code: u8,
+        data: &[u8],
+        quad_data: bool,
+    ) -> blueos_hal::err::Result<()> {
+        // Phase 1: command header (1-wire), CS still low.
+        self.qspi_send_header(opcode, cmd_code)?;
+
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 2: payload data, quad/1-wire per quad_data. CS stays low across
+        // all chunks (caller holds CS); each chunk is one USER transaction.
+        let regs = Self::spi_regs();
+        // CTRL.FREAD_QUAD is the master enable for the quad output path: on the
+        // C6 GPSPI it gates D1/D2/D3's connection to the shift register for both
+        // read and write phases (read and write share one quad output enable).
+        // Setting only USER.FWRITE_QUAD (as before) left D1/D2/D3 physically
+        // dead while D0 still toggled, so transactions completed but the panel
+        // never received a real 4-wire stream. IDF's spi_ll_master_set_line_mode
+        // and esp-hal's init_spi_data_mode both set FREAD_QUAD+FWRITE_QUAD
+        // together for quad writes; mirror that here.
+        regs.ctrl
+            .modify(CTRL::FREAD_QUAD.val(if quad_data { 1 } else { 0 }));
+        for chunk in data.chunks(SPI2_DATA_BUF_SIZE) {
+            regs.user.modify(
+                USER::DOUTDIN.val(0)
+                    + USER::USR_MOSI::SET
+                    + USER::USR_MISO::CLEAR
+                    + USER::USR_COMMAND::CLEAR
+                    + USER::USR_ADDR::CLEAR
+                    + USER::USR_DUMMY::CLEAR
+                    + USER::FWRITE_QUAD.val(if quad_data { 1 } else { 0 }),
+            );
+            self.reset_tx_fifo();
+            regs.ms_dlen
+                .write(MS_DLEN::MS_DATA_BITLEN.val((chunk.len() as u32 * 8 - 1)));
+            self.write_buf(chunk);
+            self.start_transfer()?;
+            self.wait_done();
+        }
+        Ok(())
+    }
+
+    // QSPI read: 4-byte header [0x03, cmd, 0,0] (1-wire MOSI) + dummy turnaround
+    // + MISO read (1-wire). Header and read share one USER transaction: we
+    // send the 4 header bytes on MOSI, insert 8 dummy cycles, then read N bytes
+    // from MISO. CS held low by caller. Always 1-wire (FREAD_QUAD=0).
+    fn do_qspi_read(
+        &self,
+        opcode: u8,
+        cmd_code: u8,
+        buf: &mut [u8],
+    ) -> blueos_hal::err::Result<()> {
+        if buf.is_empty() {
+            // No read requested; still send the header so the command lands.
+            return self.qspi_send_header(opcode, cmd_code);
+        }
+        let regs = Self::spi_regs();
+        let header = self.qspi_header(opcode, cmd_code);
+
+        // Half-duplex: write the 4-byte header on MOSI, 8 dummy cycles for
+        // turnaround, then read N bytes from MISO. One transaction per chunk.
+        // USR_DUMMY_CYCLELEN = 8-1 = 7; header uses USR_MOSI, response USR_MISO.
+        regs.user1
+            .write(USER1::USR_DUMMY_CYCLELEN.val(7) + USER1::USR_ADDR_BITLEN.val(0));
+        regs.user.modify(
+            USER::DOUTDIN.val(0)
+                + USER::USR_MOSI::SET
+                + USER::USR_MISO::SET
+                + USER::USR_COMMAND::CLEAR
+                + USER::USR_ADDR::CLEAR
+                + USER::USR_DUMMY::SET
+                + USER::FWRITE_QUAD.val(0),
+        );
+
+        for chunk in buf.chunks_mut(SPI2_DATA_BUF_SIZE) {
+            self.reset_tx_rx_fifo();
+            // In half-duplex, MS_DATA_BITLEN defines BOTH the MOSI output bits
+            // and the MISO input bits of the data phase. So this read path only
+            // matches when the response length equals the header length (4
+            // bytes) -- which is exactly the READ_ID (0x04) case. Set the data
+            // phase length to the header size; the panel returns 4 bytes on MISO
+            // within the same window, overwriting W0..W1 which we then read back.
+            regs.ms_dlen
+                .write(MS_DLEN::MS_DATA_BITLEN.val((Self::QSPI_HEADER_LEN as u32 * 8 - 1)));
+            self.write_buf(&header);
+            self.start_transfer()?;
+            self.wait_done();
+            self.read_buf(chunk);
+        }
+        Ok(())
+    }
 }
 
 impl<const SPI_BASE: usize, const SYS_BASE: usize, const APB_HZ: u32> PlatPeri
@@ -530,10 +785,32 @@ impl<const SPI_BASE: usize, const SYS_BASE: usize, const APB_HZ: u32> PlatPeri
 {
     fn enable(&self) {
         let sys = Self::sys_regs();
-        sys.perip_clk_en0.modify(PERIP_CLK_EN0::SPI2_CLK_EN::SET);
-        // Reset pulse; without it CMD::UPDATE may never clear.
-        sys.perip_rst_en0.modify(PERIP_RST_EN0::SPI2_RST::SET);
-        sys.perip_rst_en0.modify(PERIP_RST_EN0::SPI2_RST::CLEAR);
+
+        // --- C3: SYSTEM peripheral clock gating + reset pulse (bit6, RST 1=reset) ---
+        #[cfg(soc_esp32c3)]
+        {
+            sys.perip_clk_en0.modify(PERIP_CLK_EN0::SPI2_CLK_EN::SET);
+            // Reset pulse; without it CMD::UPDATE may never clear.
+            sys.perip_rst_en0.modify(PERIP_RST_EN0::SPI2_RST::SET);
+            sys.perip_rst_en0.modify(PERIP_RST_EN0::SPI2_RST::CLEAR);
+        }
+
+        // --- C6: PCR clock gating + reset + function clock source (RST 0=reset) ---
+        #[cfg(soc_esp32c6)]
+        {
+            // spi2_conf: enable APB clock, pulse reset (polarity inverted: 0=reset, 1=de-reset).
+            sys.spi2_conf.modify(
+                PCR_SPI2_CONF::SPI2_CLK_EN::Enabled
+                    + PCR_SPI2_CONF::SPI2_RST_EN::Reset,
+            );
+            sys.spi2_conf
+                .modify(PCR_SPI2_CONF::SPI2_RST_EN::NoReset);
+            // spi2_clkm_conf: select 80MHz PLL source, enable function clock.
+            sys.spi2_clkm_conf.modify(
+                PCR_SPI2_CLKM_CONF::SPI2_CLKM_SEL::Pll80M
+                    + PCR_SPI2_CLKM_CONF::SPI2_CLKM_EN::Enabled,
+            );
+        }
 
         let regs = Self::spi_regs();
         regs.clk_gate.write(
@@ -547,7 +824,17 @@ impl<const SPI_BASE: usize, const SYS_BASE: usize, const APB_HZ: u32> PlatPeri
         let regs = Self::spi_regs();
         regs.clk_gate.modify(CLK_GATE::MST_CLK_ACTIVE::CLEAR);
         let sys = Self::sys_regs();
+
+        #[cfg(soc_esp32c3)]
         sys.perip_clk_en0.modify(PERIP_CLK_EN0::SPI2_CLK_EN::CLEAR);
+
+        #[cfg(soc_esp32c6)]
+        {
+            sys.spi2_clkm_conf
+                .modify(PCR_SPI2_CLKM_CONF::SPI2_CLKM_EN::Disabled);
+            sys.spi2_conf
+                .modify(PCR_SPI2_CONF::SPI2_CLK_EN::Disabled);
+        }
     }
 }
 
@@ -628,6 +915,31 @@ impl<const SPI_BASE: usize, const SYS_BASE: usize, const APB_HZ: u32>
 
     fn write(&self, buf: &[u8]) -> blueos_hal::err::Result<()> {
         self.do_half_duplex_write(buf)
+    }
+}
+
+// QSPI opcodes per CO5300 datasheet (1-wire command/address, data width per method).
+const QSPI_CMD_WRITE: u8 = 0x02; // command write (1-wire data)
+const QSPI_CMD_PIXEL_WRITE: u8 = 0x32; // pixel write (4-wire data)
+const QSPI_CMD_READ: u8 = 0x03; // command read (1-wire data)
+
+impl<const SPI_BASE: usize, const SYS_BASE: usize, const APB_HZ: u32> crate::spi::Qspi
+    for Esp32Spi2<SPI_BASE, SYS_BASE, APB_HZ>
+{
+    fn qspi_write_command(&self, cmd: u8, params: &[u8]) -> blueos_hal::err::Result<()> {
+        // Command write: opcode 0x02 + addr {0x00, cmd, 0x00} + params, 1-wire.
+        self.do_qspi_write(QSPI_CMD_WRITE, cmd, params, false)
+    }
+
+    fn qspi_write_pixels(&self, pixels: &[u8]) -> blueos_hal::err::Result<()> {
+        // Pixel write: opcode 0x32 + addr {0x00, 0x2C, 0x00} + pixel stream, 4-wire data.
+        const RAMWR: u8 = 0x2C;
+        self.do_qspi_write(QSPI_CMD_PIXEL_WRITE, RAMWR, pixels, true)
+    }
+
+    fn qspi_read_command(&self, cmd: u8, buf: &mut [u8]) -> blueos_hal::err::Result<()> {
+        // Command read: opcode 0x03 + addr {0x00, cmd, 0x00} + dummy + read, 1-wire.
+        self.do_qspi_read(QSPI_CMD_READ, cmd, buf)
     }
 }
 

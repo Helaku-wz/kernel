@@ -33,3 +33,6 @@ CONFIG_ENABLE_VFS=y
 CONFIG_ENABLE_NET=n
 CONFIG_PROCFS=n
 CONFIG_UNITTEST_THREAD_NUM=16
+# LCD: enables the CO5300 QSPI AMOLED panel. CO5300 is the LCD-controller
+# choice default; LCD select SPI_CORE so BlockSpi is built automatically.
+CONFIG_LCD=y

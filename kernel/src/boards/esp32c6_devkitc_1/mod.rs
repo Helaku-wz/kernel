@@ -774,12 +774,62 @@ pub(crate) fn init() {
     }
 }
 
+// SPI2 (GPSPI2) instance for the CO5300 QSPI LCD. C6 SPI2 base 0x6008_1000,
+// PCR (clock/reset) base 0x6009_6000, APB clock 80MHz. The Esp32Spi2 driver
+// enables the PCR clock gate and applies a reset pulse in configure(), so the
+// board init does not need to touch PCR spi2_conf itself.
+pub type Spi2Impl =
+    blueos_driver::spi::esp32_spi::Esp32Spi2<0x6008_1000, 0x6009_6000, 80_000_000>;
+
 crate::define_peripheral! {
     (console_uart, blueos_driver::uart::esp32_usb_serial::Esp32UsbSerial<0x6000_F000>,
      blueos_driver::uart::esp32_usb_serial::Esp32UsbSerial::<0x6000_F000>::new()),
+    (spi2, Spi2Impl, Spi2Impl::new()),
+    // GPIO mapping: matches the ESP-IDF v5.5.3 08_LVGL_V8_Test reference
+    // demo at runtime. The demo's DisplayPort ctor defaults cs=15
+    // (display_bsp.h:29) and main.cpp:44 instantiates without overriding it,
+    // so CS=15 is what the working board actually drives. (user_config.h has a
+    // BSP_LCD_CS=GPIO5 macro, but it is unreferenced dead code -- display_bsp.cpp
+    // uses the ctor param `cs`, not the macro.) RST is NC: the panel is
+    // power-cycled via AXP2101 ALDO3 in init_panel_via_pmic(), matching the
+    // reference demo (08_LVGL_V8_Test DisplayPort_DispReset / BSP_LCD_RST=NC).
+    (lcd_cs, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(15)),
+    // I2C0 for the AXP2101 PMIC: SCL=GPIO7, SDA=GPIO8, slave address 0x34.
+    // C6 I2C0 controller base 0x6000_4000, PCR (system) base 0x6009_6000.
+    // source clock = XTAL 40MHz -- C6 has no APB/PLL I2C source, only XTAL(40M)
+    // and FOSC(~8M); I2C_CLK_SRC_DEFAULT = XTAL. The prior 80_000_000 (copied
+    // from C3 where APB is valid) was wrong: timing was computed for 80MHz while
+    // the controller actually ran on ~8MHz FOSC, starving the FSM.
+    (i2c0, blueos_driver::i2c::esp32_i2c::Esp32I2c,
+     blueos_driver::i2c::esp32_i2c::Esp32I2c::new(0x6000_4000, 0x6009_6000, 40_000_000)),
 }
 
-crate::define_pin_states!(None);
+// GPIO mapping: matches the ESP-IDF v5.5.3 08_LVGL_V8_Test reference demo at
+// runtime. The demo DisplayPort ctor defaults cs=15 (display_bsp.h:29) and
+// main.cpp:44 instantiates without overriding it, so CS=15 is what the working
+// board actually drives. (user_config.h's BSP_LCD_CS=GPIO5 is unreferenced dead
+// code; display_bsp.cpp:49 uses the `cs` ctor param, not the macro.) No RST pin.
+// CO5300/SH8601 is write-only over QSPI (4-wire pixel writes), so all four data
+// lines are routed as peripheral OUTPUT signals and none need an input route.
+// The QSPI 4-wire output uses FSPID(D0)/FSPIQ(D1)/FSPIWP(D2)/FSPIHD(D3); on
+// ESP32 a signal's IN and OUT share the same index, the distinction being
+// which FUNC*_SEL_CFG register the index is written to.
+crate::define_pin_states!(
+    blueos_driver::pinctrl::esp32_pinctrl::Esp32IoMuxPinctrl,
+    (0,  1, false, false, false, 2, Some(blueos_driver::pinctrl::esp32_pinctrl::FSPICLK_OUT_IDX), None, false, false), // SCK
+    (1,  1, false, false, false, 2, Some(blueos_driver::pinctrl::esp32_pinctrl::FSPID_OUT_IDX),  None, false, false), // D0
+    (2,  1, false, false, false, 2, Some(blueos_driver::pinctrl::esp32_pinctrl::FSPIQ_OUT_IDX),  None, false, false), // D1
+    (3,  1, false, false, false, 2, Some(blueos_driver::pinctrl::esp32_pinctrl::FSPIWP_OUT_IDX), None, false, false), // D2
+    (4,  1, false, false, false, 2, Some(blueos_driver::pinctrl::esp32_pinctrl::FSPIHD_OUT_IDX), None, false, false), // D3
+    (15, 1, false, true,  false, 2, None, None, true, false), // CS  (software-controlled, pull-up)
+    // I2C0 for the AXP2101 PMIC: SCL=GPIO7, SDA=GPIO8. Open-drain, input
+    // enabled (SDA is bidirectional, SCL is also sampled back), pull-up on
+    // (the board has external pull-ups too; this is a safe fallback). Routed
+    // through the GPIO Matrix to the I2CEXT0 controller signals.
+    (7,  1, true,  true,  false, 2, Some(blueos_driver::pinctrl::esp32_pinctrl::I2CEXT0_SCL_OUT_IDX), Some(blueos_driver::pinctrl::esp32_pinctrl::I2CEXT0_SCL_IN_IDX), false, true), // SCL
+    (8,  1, true,  true,  false, 2, Some(blueos_driver::pinctrl::esp32_pinctrl::I2CEXT0_SDA_OUT_IDX), Some(blueos_driver::pinctrl::esp32_pinctrl::I2CEXT0_SDA_IN_IDX), false, true), // SDA
+);
 
 #[inline(always)]
 pub(crate) fn send_ipi(_hart: usize) {}
@@ -793,3 +843,175 @@ static ESP32_USB_SERIAL_ISR: Esp32UsbSerialIsr<0x6000_F000, crate::drivers::seri
         tx_isr: Some(crate::drivers::serial::Serial::xmitchars),
         rx_isr: Some(crate::drivers::serial::Serial::recvchars),
     };
+
+// CO5300 LCD on the SPI2 bus. Unlike ST7789/ST7796 the CO5300/SH8601 has no
+// D/CX pin (D/CX tied low; command/data is encoded in the QSPI address phase).
+// Its config only carries cs; the panel has no RST GPIO (RST = NC on this
+// board, matching the reference demo), so the reset path is the AXP2101 ALDO3
+// power cycle in init_panel_via_pmic(), not a GPIO toggle.
+crate::define_bus! {
+    (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<
+        Spi2Impl,
+        blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+    >,
+        #[cfg(co5300)]
+        (co5300, crate::drivers::lcd::co5300::Co5300Config<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>,
+            crate::drivers::lcd::co5300::Co5300Config::<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin> {
+                cs: get_device!(lcd_cs),
+            }
+        ),
+    ),
+}
+
+#[cfg(spi_core)]
+type Spi2Bus = crate::devices::bus::Bus<
+    crate::devices::spi_core::block_spi::BlockSpi<
+        Spi2Impl,
+        blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+    >,
+>;
+
+#[cfg(spi_core)]
+static SPI2_BUS: spin::Once<alloc::sync::Arc<Spi2Bus>> = spin::Once::new();
+
+#[cfg(spi_core)]
+fn init_spi2_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<Spi2Bus>> {
+    use crate::devices::{bus::Bus, spi_core::block_spi::BlockSpi};
+    use blueos_driver::spi::SpiConfig;
+
+    if let Some(spi_bus) = SPI2_BUS.get() {
+        return Ok(spi_bus);
+    }
+
+    let spi2 = get_device!(spi2);
+    crate::kearly_println!("[SPI2] creating BlockSpi (configure SPI2 + CS pin)...");
+    // CO5300 owns the only device on this bus; its CS pin is the BlockSpi CS.
+    let block_spi = BlockSpi::new(spi2, get_device!(lcd_cs), &SpiConfig::spi_flash_default())
+        .map_err(|error| {
+            crate::kearly_println!("[SPI2] FAILED BlockSpi::new: {:?}", error);
+            match error {
+                blueos_hal::err::HalError::Timeout => crate::error::code::ETIMEDOUT,
+                _ => crate::error::code::EIO,
+            }
+        })?;
+    crate::kearly_println!("[SPI2] BlockSpi ok, registering bus");
+    SPI2_BUS.call_once(|| alloc::sync::Arc::new(Bus::new(block_spi)));
+    SPI2_BUS.get().ok_or(crate::error::code::EIO)
+}
+
+#[cfg(spi_core)]
+pub(crate) fn init_spi_bus() {
+    use crate::drivers::InitDriver;
+
+    // Bring up the AMOLED panel BEFORE probing the CO5300 driver: power up
+    // AXP2101 ALDO3 (the panel's 3.3V rail) and power-cycle it. This is the
+    // sole reset path on this board -- RST is NC (matching the reference demo
+    // 08_LVGL_V8_Test DisplayPort_DispReset, which only cycles ALDO3). This
+    // must run first so that by the time SWRESET/SLPOUT reach the panel it
+    // already has stable power and has gone through a proper power-on reset.
+    #[cfg(axp2101)]
+    {
+        if let Err(error) = init_panel_via_pmic() {
+            // Non-fatal: continue to probe the LCD anyway. A PMIC failure usually
+            // means the panel never powers on, but we still want the CO5300 probe
+            // trace so the failure is diagnosable from serial output.
+            crate::kearly_println!("[AXP2101] FAILED panel supply init: {}", error);
+        } else {
+            crate::kearly_println!("[AXP2101] ALDO3 3.3V up, panel power-cycled");
+        }
+    }
+
+    let spi2_bus = init_spi2_bus().expect("Failed to init SPI2 bus");
+    for device in crate::boards::get_bus_devices!(spi2_bus) {
+        spi2_bus
+            .register_device(device)
+            .expect("Failed to register SPI device");
+    }
+
+    #[cfg(co5300)]
+    {
+        // kearly_println because init_spi_bus runs before logger_init (boot.rs);
+        // log::warn! would be dropped silently. These lines trace exactly which
+        // step fails: probe -> init -> register, so a hang/failure is locatable
+        // from the serial output alone.
+        crate::kearly_println!("[CO5300] probing driver on spi2_bus...");
+        match spi2_bus.probe_driver(&crate::drivers::lcd::co5300::Co5300DriverModule::<
+            blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+        >::new()) {
+            Ok(driver) => {
+                crate::kearly_println!("[CO5300] probe ok, calling init...");
+                match driver.init(spi2_bus) {
+                    Ok(_) => {
+                        let (usr_to, td_to) =
+                            blueos_driver::spi::esp32_spi::spi_diag_timeouts();
+                        crate::kearly_println!(
+                            "[CO5300] init returned Ok (SPI diag: usr_timeouts={} transdone_timeouts={})",
+                            usr_to,
+                            td_to
+                        );
+                    }
+                    Err(error) => {
+                        let (usr_to, td_to) =
+                            blueos_driver::spi::esp32_spi::spi_diag_timeouts();
+                        crate::kearly_println!(
+                            "[CO5300] FAILED init: {} (SPI diag: usr_timeouts={} transdone_timeouts={})",
+                            error,
+                            usr_to,
+                            td_to
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                crate::kearly_println!("[CO5300] FAILED probe: {}", error);
+            }
+        }
+    }
+}
+
+#[cfg(i2c_core)]
+type I2c0Bus = crate::devices::bus::Bus<
+    crate::devices::i2c_core::block_i2c::BlockI2c<blueos_driver::i2c::esp32_i2c::Esp32I2c>,
+>;
+
+#[cfg(i2c_core)]
+static I2C0_BUS: spin::Once<alloc::sync::Arc<I2c0Bus>> = spin::Once::new();
+
+#[cfg(i2c_core)]
+fn init_i2c0_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<I2c0Bus>> {
+    use crate::devices::{bus::Bus, i2c_core::block_i2c::BlockI2c};
+
+    if let Some(i2c_bus) = I2C0_BUS.get() {
+        return Ok(i2c_bus);
+    }
+
+    crate::kearly_println!("[I2C0] creating BlockI2c...");
+    let block_i2c = BlockI2c::new(get_device!(i2c0)).map_err(|error| {
+        crate::kearly_println!("[I2C0] FAILED BlockI2c::new: {:?}", error);
+        crate::error::code::EIO
+    })?;
+    crate::kearly_println!("[I2C0] BlockI2c ok, registering bus");
+    I2C0_BUS.call_once(|| alloc::sync::Arc::new(Bus::new(block_i2c)));
+    I2C0_BUS.get().ok_or(crate::error::code::EIO)
+}
+
+/// Power up the AMOLED panel via the AXP2101 PMIC: bring up I2C0, configure
+/// ALDO3 = 3.3V, and power-cycle it to reset the CO5300/SH8601 panel. This is
+/// the sole reset path -- RST is NC on this board (matching the reference
+/// demo 08_LVGL_V8_Test DisplayPort_DispReset, which only cycles ALDO3).
+/// Called from `init_spi_bus` before the CO5300 driver is probed.
+#[cfg(axp2101)]
+fn init_panel_via_pmic() -> crate::drivers::Result<()> {
+    use crate::drivers::pmic::axp2101::Axp2101;
+    use crate::sync::KernelDelay;
+
+    let i2c_bus = init_i2c0_bus()?;
+    let mut pmic = Axp2101::new(i2c_bus.intf.clone());
+    let mut delay = KernelDelay;
+    pmic.init_panel_supply(&mut delay)
+        .map_err(|_| crate::error::code::EIO)
+}
+
+pub(crate) fn init_i2c_bus() {}
+
+pub(crate) fn init_gpio() {}

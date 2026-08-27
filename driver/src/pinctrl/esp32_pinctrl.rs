@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! ESP32-C3 IO_MUX + GPIO Matrix pin controller.
+//! ESP32 IO_MUX + GPIO Matrix pin controller (C3/C6).
 
 use crate::{
     gpio::esp32_gpio::{GpioEnable, GpioOut, GpioRegisters, GPIO_BASE},
@@ -26,13 +26,49 @@ use tock_registers::{
 };
 
 // SPI2/FSPI signal indices routed through the GPIO Matrix (gpio_sig_map.h).
-const FSPICLK_OUT_IDX: u32 = 63;
-const FSPIQ_IN_IDX: u32 = 64;
-const FSPID_OUT_IDX: u32 = 65;
-const FSPICS0_OUT_IDX: u32 = 68;
+// C3 and C6 share identical signal indices (63..68). On ESP32 a signal's IN
+// and OUT variants share the same index: the distinction is which register
+// group (FUNC_IN_SEL_CFG vs FUNC_OUT_SEL_CFG) the index is written to.
+pub const FSPICLK_OUT_IDX: u32 = 63;
+pub const FSPICLK_IN_IDX: u32 = 63;
+pub const FSPIQ_OUT_IDX: u32 = 64;
+pub const FSPIQ_IN_IDX: u32 = 64;
+pub const FSPID_OUT_IDX: u32 = 65;
+pub const FSPID_IN_IDX: u32 = 65;
+pub const FSPIHD_OUT_IDX: u32 = 66;
+pub const FSPIHD_IN_IDX: u32 = 66;
+pub const FSPIWP_OUT_IDX: u32 = 67;
+pub const FSPIWP_IN_IDX: u32 = 67;
+pub const FSPICS0_OUT_IDX: u32 = 68;
+pub const FSPICS0_IN_IDX: u32 = 68;
 
-// IO_MUX per-pin register offsets relative to IO_MUX base (0x60009000).
-const IO_MUX_OFFSETS: [u32; 22] = [
+// I2CEXT0 (I2C0) signal indices for the C6 GPIO Matrix (gpio_sig_map.h). C6
+// only; C3 does not use this board's I2C path. Like the FSPI signals, a given
+// I2C signal's IN and OUT variants share the same index.
+#[cfg(soc_esp32c6)]
+pub const I2CEXT0_SCL_OUT_IDX: u32 = 45;
+#[cfg(soc_esp32c6)]
+pub const I2CEXT0_SCL_IN_IDX: u32 = 45;
+#[cfg(soc_esp32c6)]
+pub const I2CEXT0_SDA_OUT_IDX: u32 = 46;
+#[cfg(soc_esp32c6)]
+pub const I2CEXT0_SDA_IN_IDX: u32 = 46;
+
+// GPIO Matrix register offsets relative to GPIO base (identical on C3/C6).
+const GPIO_PIN_REG_OFFSET: usize = 0x74; // per-pin PAD_DRIVER config
+const FUNC_IN_SEL_CFG_OFFSET: usize = 0x154; // FUNCx_IN_SEL_CFG
+const FUNC_OUT_SEL_CFG_OFFSET: usize = 0x554; // FUNCx_OUT_SEL_CFG
+
+// GPIO Matrix base address differs per SoC (same layout as GPIO_BASE in
+// esp32_gpio, but accessed via raw offsets beyond the typed GpioRegisters).
+#[cfg(soc_esp32c3)]
+const GPIO_MATRIX_BASE: usize = 0x60004000;
+#[cfg(soc_esp32c6)]
+const GPIO_MATRIX_BASE: usize = 0x60091000;
+
+// IO_MUX per-pin register offsets relative to IO_MUX base: 0x04 + 4*pin.
+// Covers the full pin range of both SoCs (C3: 22 pins, C6: 30 pins).
+const IO_MUX_OFFSETS: [u32; 30] = [
     0x04, // GPIO0
     0x08, // GPIO1
     0x0C, // GPIO2
@@ -55,9 +91,21 @@ const IO_MUX_OFFSETS: [u32; 22] = [
     0x50, // GPIO19
     0x54, // GPIO20
     0x58, // GPIO21
+    0x5C, // GPIO22
+    0x60, // GPIO23
+    0x64, // GPIO24
+    0x68, // GPIO25
+    0x6C, // GPIO26
+    0x70, // GPIO27
+    0x74, // GPIO28
+    0x78, // GPIO29
 ];
 
+// IO_MUX base address differs per SoC.
+#[cfg(soc_esp32c3)]
 const IO_MUX_BASE: usize = 0x60009000;
+#[cfg(soc_esp32c6)]
+const IO_MUX_BASE: usize = 0x60090000;
 
 register_bitfields! [
     u32,
@@ -100,7 +148,7 @@ register_bitfields! [
 ];
 
 fn configure_open_drain(pin: u8, open_drain: bool) {
-    let addr = 0x60004000 + 0x74 + 4 * pin as usize;
+    let addr = GPIO_MATRIX_BASE + GPIO_PIN_REG_OFFSET + 4 * pin as usize;
     let reg = unsafe { &*(addr as *const ReadWrite<u32, GpioPinFields::Register>) };
     reg.modify(GpioPinFields::PAD_DRIVER.val(open_drain as u32));
 }
@@ -109,10 +157,18 @@ register_bitfields! [
     u32,
 
     // GPIO_FUNCx_IN_SEL_CFG_REG: route GPIO pin to a peripheral input signal.
+    // C6 layout (gpio_reg.h:2455-2472): IN_SEL [5:0] (6 bits, NOT 5 -- indices
+    // go up to 46 for I2C0_SDA, 5 bits can't hold that), IN_INV_SEL bit6, and
+    // the input-routing enable is SIG_IN_SEL at bit7 (1 = route the peripheral
+    // input via the GPIO Matrix; 0 = bypass/don't route). The old layout put
+    // IN_INV_SEL at bit5 and SEL at bit6: writing SEL=1 set IN_INV_SEL (input
+    // inversion) while the real enable bit7 stayed 0, so the peripheral never
+    // received the pad input at all -- for I2C this starved the FSM of SCL/SDA
+    // feedback and tripped SCL_ST_TO (status 0x00002000) on the first transfer.
     pub FuncInSelCfg [
-        IN_SEL     OFFSET(0) NUMBITS(5) [],
-        IN_INV_SEL OFFSET(5) NUMBITS(1) [],
-        SEL        OFFSET(6) NUMBITS(1) [],  // 1 = route via GPIO Matrix, 0 = bypass
+        IN_SEL     OFFSET(0) NUMBITS(6) [],
+        IN_INV_SEL OFFSET(6) NUMBITS(1) [],
+        SEL        OFFSET(7) NUMBITS(1) [],  // SIG_IN_SEL: 1 = route via GPIO Matrix, 0 = bypass
     ],
 ];
 
@@ -129,7 +185,7 @@ fn write_io_mux(pin: u8, mcu_sel: u32, ie: bool, pu: bool, pd: bool, drv: u32) {
 }
 
 fn route_signal_out(pin: u8, signal_idx: u32, oen_sel: u32) {
-    let addr = 0x60004000 + 0x554 + 4 * pin as usize;
+    let addr = GPIO_MATRIX_BASE + FUNC_OUT_SEL_CFG_OFFSET + 4 * pin as usize;
     let reg = unsafe { &*(addr as *const ReadWrite<u32, FuncOutSelCfg::Register>) };
     reg.write(
         FuncOutSelCfg::OUT_SEL.val(signal_idx)
@@ -140,7 +196,7 @@ fn route_signal_out(pin: u8, signal_idx: u32, oen_sel: u32) {
 }
 
 fn route_signal_in(signal_idx: u32, pin: u32) {
-    let addr = 0x60004000 + 0x154 + 4 * signal_idx as usize;
+    let addr = GPIO_MATRIX_BASE + FUNC_IN_SEL_CFG_OFFSET + 4 * signal_idx as usize;
     let reg = unsafe { &*(addr as *const ReadWrite<u32, FuncInSelCfg::Register>) };
     reg.write(
         FuncInSelCfg::SEL.val(1) + FuncInSelCfg::IN_INV_SEL.val(0) + FuncInSelCfg::IN_SEL.val(pin),
@@ -194,10 +250,25 @@ impl AlterFuncPin for Esp32IoMuxPinctrl {
         write_io_mux(self.pin, self.mcu_sel, self.ie, self.pu, self.pd, self.drv);
         configure_open_drain(self.pin, self.open_drain);
 
+        // GPIO_ENABLE is a separate per-pin output-enable latch that ANDs with
+        // the peripheral's OEN before the pad actually drives. ESP-IDF sets it
+        // for every output line: esp_rom_gpio_connect_out_signal writes
+        // GPIO_ENABLE_W1TS unconditionally, and spi_common.c calls
+        // gpio_set_direction(GPIO_MODE_INPUT_OUTPUT) which does the same. Without
+        // this, OEN_SEL=0 peripheral lines (SPI D0-D3/SCK) stayed high-Z: the
+        // SPI controller toggled its OEN but the pad never drove, so D1/D2/D3
+        // never transitioned -- only D0/SCK (active in every transaction) looked
+        // alive. Software CS (gpio_output=true) already sets this below.
         if let Some(signal_idx) = self.out_signal {
             // Software-controlled pins (CS) use OEN_SEL=1; peripheral pins use OEN_SEL=0.
             let oen_sel = if self.gpio_output { 1u32 } else { 0u32 };
             route_signal_out(self.pin, signal_idx, oen_sel);
+            if !self.gpio_output {
+                let gpio_regs = &*GPIO_BASE;
+                gpio_regs
+                    .enable_w1ts
+                    .write(GpioEnable::DATA.val(1 << self.pin));
+            }
         }
 
         if let Some(signal_idx) = self.in_signal {

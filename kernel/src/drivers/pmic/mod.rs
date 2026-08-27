@@ -12,5 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(any(soc_esp32c3, soc_esp32c6))]
-pub mod esp32_gpio;
+//! PMIC (Power Management IC) drivers.
+
+#[cfg(axp2101)]
+pub mod axp2101;

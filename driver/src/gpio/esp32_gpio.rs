@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! ESP32-C3 GPIO output pin driver. Pin mode is configured by
+//! ESP32 GPIO output pin driver (C3/C6). Pin mode is configured by
 //! `pinctrl::esp32_pinctrl`; this driver only flips the output data latch.
 
 use crate::static_ref::StaticRef;
@@ -20,8 +20,13 @@ use tock_registers::{
     interfaces::Writeable, register_bitfields, register_structs, registers::ReadWrite,
 };
 
+// GPIO base address differs per SoC; the register layout is identical.
+#[cfg(soc_esp32c3)]
 pub(crate) const GPIO_BASE: StaticRef<GpioRegisters> =
     unsafe { StaticRef::new(0x60004000 as *const GpioRegisters) };
+#[cfg(soc_esp32c6)]
+pub(crate) const GPIO_BASE: StaticRef<GpioRegisters> =
+    unsafe { StaticRef::new(0x60091000 as *const GpioRegisters) };
 
 register_bitfields! [
     u32,

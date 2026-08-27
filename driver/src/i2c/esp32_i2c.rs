@@ -12,7 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! ESP32-C3 I2C0 register definitions.
+//! ESP32-C3/C6 I2C0 register definitions.
+//!
+//! The I2C controller register block is identical across ESP32-C3 and C6
+//! (same Synopsys-style IP). Only the peripheral base address and the
+//! clock-gating/reset registers differ: C3 uses the SYSTEM peripheral
+//! (perip_clk_en0/perip_rst_en0, bit7), while C6 uses the PCR block
+//! (i2c_conf/i2c_sclk_conf). Reset polarity is the standard active-high
+//! convention on both (rst=1 asserts).
 
 use core::cell::UnsafeCell;
 
@@ -261,8 +268,52 @@ register_bitfields! [
     pub PERIP_RST_EN0 [
         I2C_EXT0_RST OFFSET(7) NUMBITS(1) [],
     ],
+
+    // C6 PCR `i2c_conf` register (PCR base + 0x20).
+    // Reset polarity is the STANDARD active-high convention (NOT inverted despite
+    // pcr_struct.h's misleading "Set 0 to reset" comment): rst_en=1 asserts
+    // reset, rst_en=0 deasserts (working). This is proven by uart_ll_is_enabled
+    // (uart_ll.h:240) testing `!rst_en`, and by every C6 *_ll_reset_register
+    // pulsing rst_en 1->0 (i2c/spi2/uart0/uart1/mspi all do the same).
+    // pcr_struct.h default rst_en=0 means the controller ships already working.
+    pub PCR_I2C_CONF [
+        I2C_CLK_EN OFFSET(0) NUMBITS(1) [
+            Enabled = 1,
+            Disabled = 0,
+        ],
+        I2C_RST_EN OFFSET(1) NUMBITS(1) [
+            NoReset = 0,
+            Reset = 1,
+        ],
+    ],
+
+    // C6 PCR `i2c_sclk_conf` register (PCR base + 0x24). Field layout per
+    // esp-idf soc/esp32c6/register/soc/pcr_struct.h:212-241. The integral
+    // divider (i2c_sclk_div_num) lives HERE in PCR, not in I2C0.clk_conf -- on
+    // C6 the I2C0.clk_conf divider fields are unused and ESP-IDF never writes
+    // them. i2c_sclk_sel: 0=XTAL(40MHz), 1=FOSC(~8MHz). C6 has NO APB and NO
+    // PLL I2C source -- the prior "Pll80M=1" enum name was wrong and routed the
+    // controller to the ~8MHz FOSC, while timing was computed for 80MHz, making
+    // every SCL period ~10x too long and starving the software poll loop.
+    pub PCR_I2C_SCLK_CONF [
+        I2C_SCLK_DIV_A OFFSET(0) NUMBITS(6) [],
+        I2C_SCLK_DIV_B OFFSET(6) NUMBITS(6) [],
+        I2C_SCLK_DIV_NUM OFFSET(12) NUMBITS(8) [],
+        I2C_SCLK_SEL OFFSET(20) NUMBITS(1) [
+            Xtal = 0,
+            Fosc = 1,
+        ],
+        I2C_SCLK_EN OFFSET(22) NUMBITS(1) [
+            Enabled = 1,
+            Disabled = 0,
+        ],
+    ],
 ];
 
+// System/PCR registers for I2C0 clock gating and reset.
+// C3: SYSTEM peripheral (perip_clk_en0 @ +0x10, perip_rst_en0 @ +0x18, bit7).
+// C6: PCR peripheral (i2c_conf @ +0x20, i2c_sclk_conf @ +0x24).
+#[cfg(soc_esp32c3)]
 register_structs! {
     SystemRegisters {
         (0x00 => _reserved0),
@@ -270,6 +321,16 @@ register_structs! {
         (0x14 => _reserved1),
         (0x18 => perip_rst_en0: ReadWrite<u32, PERIP_RST_EN0::Register>),
         (0x1C => @END),
+    }
+}
+
+#[cfg(soc_esp32c6)]
+register_structs! {
+    SystemRegisters {
+        (0x00 => _reserved0),
+        (0x20 => i2c_conf: ReadWrite<u32, PCR_I2C_CONF::Register>),
+        (0x24 => i2c_sclk_conf: ReadWrite<u32, PCR_I2C_SCLK_CONF::Register>),
+        (0x28 => @END),
     }
 }
 
@@ -314,45 +375,61 @@ fn calculate_timing(source_clk: u32, baudrate: u32) -> blueos_hal::err::Result<T
         return Err(blueos_hal::err::HalError::InvalidParam);
     }
 
-    let divider = source_clk as u64 / (baudrate as u64 * 1024) + 1;
-    if divider == 0 || divider > 256 {
-        return Err(blueos_hal::err::HalError::InvalidParam);
-    }
+    // Start from the coarsest divider that still reaches the target baudrate,
+    // then grow it until every SCL/SDA timing field fits its register field
+    // width. The single-pass formula yields divider = source_clk/(br*1024)+1,
+    // which is 1 for any baudrate >= source_clk/1024 -- e.g. 100 kHz on an 80 MHz
+    // source clock (ESP32-C6). That gives half_cycle = 400 and
+    // scl_wait_high_period = 198, which overflows its 7-bit field (0x7f) and
+    // makes configure() reject the whole config with InvalidParam before any
+    // transaction even starts. ESP-IDF's i2c_ll resolves this by searching for
+    // a larger divider; we mirror that here. Raising the divider lowers sclk,
+    // which shrinks half_cycle and every derived field with it.
+    let mut divider = source_clk as u64 / (baudrate as u64 * 1024) + 1;
 
-    let sclk = source_clk / divider as u32;
-    let half_cycle = sclk / baudrate / 2;
-    if half_cycle < 4 {
-        return Err(blueos_hal::err::HalError::InvalidParam);
-    }
+    let timing = loop {
+        if divider == 0 || divider > 256 {
+            return Err(blueos_hal::err::HalError::InvalidParam);
+        }
+        let sclk = source_clk / divider as u32;
+        let half_cycle = sclk / baudrate / 2;
+        if half_cycle < 4 {
+            return Err(blueos_hal::err::HalError::InvalidParam);
+        }
 
-    let scl_wait_high_period = if baudrate >= 80_000 {
-        half_cycle / 2 - 2
-    } else {
-        half_cycle / 4
+        let scl_wait_high_period = if baudrate >= 80_000 {
+            half_cycle / 2 - 2
+        } else {
+            half_cycle / 4
+        };
+        let scl_high_period = half_cycle - scl_wait_high_period;
+
+        let timing = Timing {
+            divider: divider as u32 - 1,
+            scl_low_period: half_cycle - 1,
+            scl_high_period,
+            scl_wait_high_period,
+            sda_hold_time: half_cycle / 4 - 1,
+            sda_sample_time: half_cycle / 2 - 1,
+            scl_setup_time: half_cycle - 1,
+            scl_hold_time: half_cycle - 1,
+        };
+
+        if timing.scl_low_period > 0x1ff
+            || timing.scl_high_period > 0x1ff
+            || timing.scl_wait_high_period > 0x7f
+            || timing.sda_hold_time > 0x1ff
+            || timing.sda_sample_time > 0x1ff
+            || timing.scl_setup_time > 0x1ff
+            || timing.scl_hold_time > 0x1ff
+        {
+            // At least one field overflowed its register field width; a larger
+            // divider lowers half_cycle and shrinks every field. Try again.
+            divider += 1;
+            continue;
+        }
+        break timing;
     };
-    let scl_high_period = half_cycle - scl_wait_high_period;
-
-    let timing = Timing {
-        divider: divider as u32 - 1,
-        scl_low_period: half_cycle - 1,
-        scl_high_period,
-        scl_wait_high_period,
-        sda_hold_time: half_cycle / 4 - 1,
-        sda_sample_time: half_cycle / 2 - 1,
-        scl_setup_time: half_cycle - 1,
-        scl_hold_time: half_cycle - 1,
-    };
-
-    if timing.scl_low_period > 0x1ff
-        || timing.scl_high_period > 0x1ff
-        || timing.scl_wait_high_period > 0x7f
-        || timing.sda_hold_time > 0x1ff
-        || timing.sda_sample_time > 0x1ff
-        || timing.scl_setup_time > 0x1ff
-        || timing.scl_hold_time > 0x1ff
-    {
-        return Err(blueos_hal::err::HalError::InvalidParam);
-    }
 
     Ok(timing)
 }
@@ -584,11 +661,25 @@ impl Esp32I2c {
     fn configure_timing(&self, baudrate: u32) -> blueos_hal::err::Result<()> {
         let timing = calculate_timing(self.source_clk, baudrate)?;
 
+        // On C6 the I2C clock divider lives in PCR.i2c_sclk_conf, NOT in
+        // I2C0.clk_conf (the latter's divider fields are unused on C6 and
+        // ESP-IDF never writes them). i2c_sclk_div_num = integral divider - 1,
+        // div_a/div_b fractional part = 0. Mirrors i2c_ll_master_set_bus_timing
+        // (esp32c6 i2c_ll.h:175-179).
+        #[cfg(soc_esp32c6)]
+        self.system_registers.i2c_sclk_conf.modify(
+            PCR_I2C_SCLK_CONF::I2C_SCLK_DIV_NUM.val(timing.divider)
+                + PCR_I2C_SCLK_CONF::I2C_SCLK_DIV_A.val(0)
+                + PCR_I2C_SCLK_CONF::I2C_SCLK_DIV_B.val(0),
+        );
+        // C3 keeps the divider in I2C0.clk_conf.sclk_div_num (no PCR divider).
+        #[cfg(soc_esp32c3)]
         self.registers.clk_conf.write(
             CLK_CONF::SCLK_DIV_NUM.val(timing.divider)
                 + CLK_CONF::SCLK_SEL::CLEAR
                 + CLK_CONF::SCLK_ACTIVE::SET,
         );
+
         self.registers
             .scl_low_period
             .write(SCL_LOW_PERIOD::SCL_LOW_PERIOD.val(timing.scl_low_period));
@@ -624,23 +715,61 @@ unsafe impl Sync for Esp32I2c {}
 
 impl PlatPeri for Esp32I2c {
     fn enable(&self) {
-        self.system_registers
-            .perip_clk_en0
-            .modify(PERIP_CLK_EN0::I2C_EXT0_CLK_EN::SET);
-        self.system_registers
-            .perip_rst_en0
-            .modify(PERIP_RST_EN0::I2C_EXT0_RST::SET);
-        self.system_registers
-            .perip_rst_en0
-            .modify(PERIP_RST_EN0::I2C_EXT0_RST::CLEAR);
+        // --- C3: SYSTEM peripheral clock gating + reset pulse (bit7, RST 1=reset) ---
+        #[cfg(soc_esp32c3)]
+        {
+            self.system_registers
+                .perip_clk_en0
+                .modify(PERIP_CLK_EN0::I2C_EXT0_CLK_EN::SET);
+            self.system_registers
+                .perip_rst_en0
+                .modify(PERIP_RST_EN0::I2C_EXT0_RST::SET);
+            self.system_registers
+                .perip_rst_en0
+                .modify(PERIP_RST_EN0::I2C_EXT0_RST::CLEAR);
+        }
+
+        // --- C6: PCR clock gating + reset + function clock source ---
+        #[cfg(soc_esp32c6)]
+        {
+            // i2c_conf: enable APB clock, pulse reset 1->0 (active-high).
+            // rst_en=1 asserts reset, rst_en=0 deasserts/working. Mirrors
+            // i2c_ll_reset_register (esp32c6 i2c_ll.h:161-162).
+            self.system_registers.i2c_conf.modify(
+                PCR_I2C_CONF::I2C_CLK_EN::Enabled + PCR_I2C_CONF::I2C_RST_EN::Reset,
+            );
+            self.system_registers
+                .i2c_conf
+                .modify(PCR_I2C_CONF::I2C_RST_EN::NoReset);
+            // i2c_sclk_conf: select XTAL (40MHz) source + enable function clock.
+            // C6 has no APB/PLL I2C source -- only XTAL(40M) and FOSC(~8M).
+            // ESP-IDF i2c_ll_set_source_clk: sel = (src==RC_FAST)?1:0, i.e. 0=XTAL.
+            self.system_registers.i2c_sclk_conf.modify(
+                PCR_I2C_SCLK_CONF::I2C_SCLK_SEL::Xtal
+                    + PCR_I2C_SCLK_CONF::I2C_SCLK_EN::Enabled,
+            );
+        }
+
         self.registers.ctr.modify(CTR::CLK_EN::SET);
     }
 
     fn disable(&self) {
         self.registers.ctr.modify(CTR::CLK_EN::CLEAR);
+
+        #[cfg(soc_esp32c3)]
         self.system_registers
             .perip_clk_en0
             .modify(PERIP_CLK_EN0::I2C_EXT0_CLK_EN::CLEAR);
+
+        #[cfg(soc_esp32c6)]
+        {
+            self.system_registers
+                .i2c_sclk_conf
+                .modify(PCR_I2C_SCLK_CONF::I2C_SCLK_EN::Disabled);
+            self.system_registers
+                .i2c_conf
+                .modify(PCR_I2C_CONF::I2C_CLK_EN::Disabled);
+        }
     }
 }
 
@@ -651,10 +780,13 @@ impl Configuration<super::I2cConfig> for Esp32I2c {
         self.enable();
 
         self.registers.ctr.write(
-            // Match esp-hal/ESP-IDF: use direct peripheral output together with
-            // GPIO_PINn_PAD_DRIVER=open-drain on SDA and SCL.
-            CTR::SDA_FORCE_OUT::SET
-                + CTR::SCL_FORCE_OUT::SET
+            // sda_force_out=0, scl_force_out=0 per ESP-IDF i2c_ll_master_init
+            // (esp32c6 i2c_ll.h:902-903): in master mode the GPIO matrix
+            // open-drain config (PAD_DRIVER=1) drives the lines, NOT direct
+            // force-out. force_out=1 had fought the open-drain pad config and
+            // prevented SCL/SDA from toggling, starving the FSM.
+            CTR::SDA_FORCE_OUT::CLEAR
+                + CTR::SCL_FORCE_OUT::CLEAR
                 + CTR::MS_MODE::Master
                 + CTR::TX_LSB_FIRST::CLEAR
                 + CTR::RX_LSB_FIRST::CLEAR
@@ -668,15 +800,29 @@ impl Configuration<super::I2cConfig> for Esp32I2c {
                 + FILTER_CFG::SDA_FILTER_EN::SET,
         );
         self.configure_timing(config.baudrate)?;
+        // Enable hardware timeout (ESP-IDF i2c_ll_master_set_bus_timing:198 sets
+        // time_out_en=1). With it cleared, a stuck SCL/slave produced NO hardware
+        // timeout interrupt (bit8), leaving only the software poll limit -- which
+        // is exactly the bare 0x80000000 status we saw. time_out_value follows
+        // the ESP-IDF formula tout = clz(5*half_cycle)+2 (~23 for 100k/XTAL40M).
         self.registers
             .to
-            .write(TO::TIME_OUT_VALUE.val(1) + TO::TIME_OUT_EN::CLEAR);
+            .write(TO::TIME_OUT_VALUE.val(23) + TO::TIME_OUT_EN::SET);
+        // ESP-IDF never writes scl_st_time_out / scl_main_st_time_out; they keep
+        // their reset default of 16 (i2c_struct.h:150/164, NOT 0). Writing 0 set
+        // the SCL_FSM "state-unchanged" threshold to 0, so the FSM was flagged as
+        // timed out the instant it lingered in any SCL state -- which is normal
+        // while SCL is held high -- and bit13 (SCL_ST_TO / I2C_LL_INTR_ST_TO)
+        // asserted on the very first transaction (status 0x00002000). ESP-IDF
+        // doesn't even enable or handle ST_TO in master mode
+        // (I2C_LL_MASTER_EVENT_INTR omits it), so leaving the default 16 here
+        // matches reference behavior and avoids the spurious early timeout.
         self.registers
             .scl_st_time_out
-            .write(SCL_ST_TIME_OUT::SCL_ST_TO.val(23));
+            .write(SCL_ST_TIME_OUT::SCL_ST_TO.val(16));
         self.registers
             .scl_main_st_time_out
-            .write(SCL_MAIN_ST_TIME_OUT::SCL_MAIN_ST_TO.val(23));
+            .write(SCL_MAIN_ST_TIME_OUT::SCL_MAIN_ST_TO.val(16));
         self.registers.int_ena.set(0);
         self.enable_fifo(1)?;
         self.reset_commands();

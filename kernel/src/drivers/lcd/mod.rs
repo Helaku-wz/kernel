@@ -31,6 +31,8 @@ const FB_VISUAL_TRUECOLOR: u32 = 2;
 pub mod st7789;
 #[cfg(st7796)]
 pub mod st7796;
+#[cfg(co5300)]
+pub mod co5300;
 
 pub struct LcdFramebuffer<T> {
     width: u32,
@@ -124,33 +126,43 @@ impl<T: Lcd> FramebufferOps for LcdFramebuffer<T> {
             return Err(embedded_io::ErrorKind::InvalidInput);
         }
 
-        let mut pixel_index = u32::try_from(offset / u64::from(LCD_BYTES_PER_PIXEL))
-            .map_err(|_| embedded_io::ErrorKind::InvalidInput)?;
-        let mut written = 0;
-        let mut display = &mut self.display;
-
-        while written < buf.len() {
-            let row = pixel_index / self.width;
-            let col = pixel_index % self.width;
-            let row_pixels =
-                (self.width - col).min((buf.len() - written) as u32 / LCD_BYTES_PER_PIXEL);
-            let row_bytes = row_pixels as usize * LCD_BYTES_PER_PIXEL as usize;
-            display
-                .draw_area(
-                    DrawArea {
-                        row_start: row,
-                        row_end: row,
-                        col_start: col,
-                        col_end: col + row_pixels - 1,
-                    },
-                    &buf[written..written + row_bytes],
-                )
-                .map_err(lcd_error_to_io_error)?;
-            pixel_index += row_pixels;
-            written += row_bytes;
+        // Whole-row alignment: the fb write must start at a row boundary and
+        // span an integer number of rows. This guarantees col_start == 0 and a
+        // full-width window, so CASET/RASET are always the full 0..479 range.
+        // We do NOT enforce a ">= 2 rows" minimum here: the CO5300 reference
+        // driver (esp_lcd_co5601/sh8601 tx_color) accepts a single-row RAMWR
+        // window, and fb_example fills the panel one row per write call. A
+        // single-row write just sets row_start == row_end; the panel handles it.
+        let bytes_per_row = self.width as usize * LCD_BYTES_PER_PIXEL as usize;
+        if offset as usize % bytes_per_row != 0 || buf.len() % bytes_per_row != 0 {
+            return Err(embedded_io::ErrorKind::InvalidInput);
         }
 
-        Ok(written)
+        let start_row = u32::try_from((offset / u64::from(LCD_BYTES_PER_PIXEL)) / u64::from(self.width))
+            .map_err(|_| embedded_io::ErrorKind::InvalidInput)?;
+        let row_count = u32::try_from(buf.len() / bytes_per_row)
+            .map_err(|_| embedded_io::ErrorKind::InvalidInput)?;
+        if row_count == 0 {
+            return Ok(0);
+        }
+        // Clamp the end row to the panel height; draw_area also clamps, but keep
+        // the window sane so set_window never gets an out-of-range RASET value.
+        let end_row = (start_row + row_count - 1).min(self.height - 1);
+        let draw_rows = end_row - start_row + 1;
+        let draw_bytes = draw_rows as usize * bytes_per_row;
+
+        self.display
+            .draw_area(
+                DrawArea {
+                    row_start: start_row,
+                    row_end: end_row,
+                    col_start: 0,
+                    col_end: self.width - 1,
+                },
+                &buf[..draw_bytes],
+            )
+            .map_err(lcd_error_to_io_error)?;
+        Ok(draw_bytes)
     }
 
     fn byte_len(&self) -> Result<u64, embedded_io::ErrorKind> {

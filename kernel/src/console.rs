@@ -61,7 +61,25 @@ impl fmt::Write for EarlyConsole {
         let _guard = DisableInterruptGuard::new();
         let uart = crate::boards::get_device!(console_uart);
         for byte in s.as_bytes() {
-            while uart.is_bus_busy() {}
+            // Cap the busy-wait: EarlyConsole runs with interrupts disabled, so
+            // the USB Serial JTAG TX-done ISR never fires to drain IN_EP_DATA_FREE.
+            // An unbounded `while is_bus_busy() {}` deadlocks once the host's IN
+            // polling falls behind the print rate -- CO5300/AXP init prints fill
+            // the FIFO and hang forever at this line, freezing the whole boot
+            // before `init returned Ok` can print. Spin a bounded number of
+            // iterations; on timeout drop the byte and continue rather than
+            // hanging the entire kernel initialization.
+            let mut spin = 0u32;
+            while uart.is_bus_busy() {
+                spin += 1;
+                if spin >= 200_000 {
+                    break;
+                }
+            }
+            if spin >= 200_000 {
+                // FIFO never drained; drop this byte to avoid blocking boot.
+                continue;
+            }
             uart.write_data8(*byte);
             uart.flush_tx_fifo();
         }
