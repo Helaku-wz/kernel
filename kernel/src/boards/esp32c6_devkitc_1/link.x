@@ -45,8 +45,9 @@ MEMORY
        "Failed to fetch app description header" / "not bootable".
 
        The fix mirrors upstream esp-hal (esp32c6/memory.x): a single ROM region
-       aliased to both ROTEXT and RODATA, with .rotext_dummy reserving the
-       rodata footprint inside it so the two do not overlap. */
+       aliased to both ROTEXT and RODATA. The output sections below make the
+       descriptor and read-only data contiguous, then insert the required gap
+       before text so the image has exactly two mapped ROM segments. */
     ROM : ORIGIN = 0x42000000 + 0x20, LENGTH = 0x400000 - 0x20
 
     /* RTC fast memory (executable). Persists over deep sleep. */
@@ -142,16 +143,59 @@ SECTIONS {
 }
 
 SECTIONS {
-  /* For ESP App Description, must be placed first in image */
-  .rodata_desc : ALIGN(0x10)
+  /* The descriptor must remain a named section: esptool moves this section
+     to the first flash segment, whose payload starts at image offset 0x20. */
+  .flash.appdesc : ALIGN(4)
   {
-      KEEP(*(.rodata_desc));
-      KEEP(*(.rodata_desc.*));
+    KEEP(*(.flash.appdesc));
+    KEEP(*(.flash.appdesc.*));
+    KEEP(*(.rodata_desc));
+    KEEP(*(.rodata_desc.*));
   } > RODATA
 
-  .rodata : ALIGN(0x10)
+  /* esptool 4.7 ignores NOBITS sections when reading ELF sections. Emit real
+     bytes here so appdesc (0x...20..0x...120) and rodata (0x...140) merge
+     into one flash-mapped segment without moving the descriptor. */
+  .rodata_merge : ALIGN(4)
+  {
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+    BYTE(0);
+  } > RODATA
+
+  .rodata : ALIGN(4)
   {
     . = ALIGN (4);
+    _rodata_start = ABSOLUTE(.);
     *(.rodata .rodata.*)
     *(.srodata .srodata.*)
     . = ALIGN(4);
@@ -167,33 +211,23 @@ SECTIONS {
     KEEP (*(EXCLUDE_FILE (*crtend.* *crtbegin.*) .init_array))
     PROVIDE(__init_array_end = .);
     . = ALIGN(4);
+    _rodata_end = ABSOLUTE(.);
+  } > RODATA
+
+  .rodata.wifi : ALIGN(4)
+  {
+    . = ALIGN(4);
+    *( .rodata_wlog_*.* )
+    . = ALIGN(4);
   } > RODATA
 }
 
 SECTIONS {
-  .rotext_dummy (NOLOAD) :
+  /* ESP-IDF expects a separate text ROM segment after the data ROM segment. */
+  .text_gap (NOLOAD) :
   {
-    /* This dummy section represents the .rodata section within ROTEXT.
-    * Since the same physical memory is mapped to both DROM and IROM,
-    * we need to make sure the .rodata and .text sections don't overlap.
-    * We skip the amount of memory taken by .rodata* in .text
-    */
-
-    /* Start at the same alignment constraint than .flash.text */
-
-    . = ALIGN(ALIGNOF(.rodata));
-
-    /* Create an empty gap as big as .text section */
-
-    . = . + SIZEOF(.rodata_desc);
-    . = . + SIZEOF(.rodata);
-
-    /* Prepare the alignment of the section above. Few bytes (0x20) must be
-     * added for the mapping header.
-     */
-
+    . = . + 8;
     . = ALIGN(0x10000) + 0x20;
-    _rotext_reserved_start = .;
   } > ROTEXT
 
   .text : ALIGN(4)
