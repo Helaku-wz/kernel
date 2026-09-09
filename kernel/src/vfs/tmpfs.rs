@@ -26,6 +26,7 @@ use crate::{
     },
 };
 use alloc::{
+    boxed::Box,
     collections::BTreeMap,
     string::String,
     sync::{Arc, Weak},
@@ -43,10 +44,107 @@ static MAGIC: usize = 0x01021994;
 const ROOT_INO: InodeNo = 1;
 const BLOCK_SIZE: usize = 4096;
 
+/// Chunked backing store for a tmpfs regular file.
+///
+/// File contents are held as a `Vec` of fixed-size `BLOCK_SIZE` chunks rather
+/// than a single contiguous `Vec<u8>`. Appending data therefore only ever
+/// allocates one 4 KiB block at a time; the previous design grew one `Vec`
+/// whose doubling strategy (`resize`/`reserve`) reached a 64 KiB realloc that
+/// could not be satisfied on small, fragmented heaps (e.g. the 449 KiB HP RAM
+/// on esp32c6), aborting with "memory allocation of 65536 bytes failed".
+///
+/// `len` is the logical file length in bytes (`<= chunks * BLOCK_SIZE`); the
+/// tail of the last chunk is zero-filled up to the chunk boundary.
+#[derive(Debug, Default)]
+struct ChunkedFile {
+    chunks: Vec<Box<[u8; BLOCK_SIZE]>>,
+    len: usize,
+}
+
+impl ChunkedFile {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Logical capacity across all allocated chunks.
+    #[allow(dead_code)]
+    fn capacity(&self) -> usize {
+        self.chunks.len() * BLOCK_SIZE
+    }
+
+    /// Extend the chunk list so that `needed` bytes are addressable,
+    /// appending zero-filled chunks as needed. Never reallocates an existing
+    /// chunk; each new chunk is an independent `Box` allocation.
+    fn ensure_capacity(&mut self, needed: usize) {
+        let needed_chunks = needed.div_ceil(BLOCK_SIZE);
+        while self.chunks.len() < needed_chunks {
+            self.chunks.push(Box::new([0u8; BLOCK_SIZE]));
+        }
+    }
+
+    /// Grow or shrink the logical file length to `new_len`, allocating or
+    /// freeing whole chunks as appropriate and zero-filling the tail.
+    fn resize(&mut self, new_len: usize) {
+        self.ensure_capacity(new_len);
+        if new_len < self.len {
+            // Zero the freed tail within the last kept chunk so subsequent
+            // growth reads back zeros instead of stale data.
+            let last_chunk = new_len / BLOCK_SIZE;
+            let tail_start = new_len % BLOCK_SIZE;
+            if tail_start != 0 {
+                self.chunks[last_chunk][tail_start..].fill(0);
+            }
+            let drop_from = new_len.div_ceil(BLOCK_SIZE);
+            self.chunks.truncate(drop_from);
+        }
+        self.len = new_len;
+    }
+
+    /// Copy `buf` into the file at `offset`, growing the store as needed.
+    fn write_at(&mut self, offset: usize, buf: &[u8]) {
+        let end = offset + buf.len();
+        if end > self.len {
+            self.ensure_capacity(end);
+            self.len = end;
+        }
+        let mut written = 0;
+        while written < buf.len() {
+            let abs = offset + written;
+            let ci = abs / BLOCK_SIZE;
+            let off = abs % BLOCK_SIZE;
+            let take = (BLOCK_SIZE - off).min(buf.len() - written);
+            self.chunks[ci][off..off + take].copy_from_slice(&buf[written..written + take]);
+            written += take;
+        }
+    }
+
+    /// Copy up to `buf.len()` bytes starting at `offset` into `buf`, clamped to
+    /// the current file length.
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let read_pos = self.len.min(offset);
+        let read_end = self.len.min(offset + buf.len());
+        let read_size = read_end - read_pos;
+        let mut read = 0;
+        while read < read_size {
+            let abs = read_pos + read;
+            let ci = abs / BLOCK_SIZE;
+            let off = abs % BLOCK_SIZE;
+            let take = (BLOCK_SIZE - off).min(read_size - read);
+            buf[read..read + take].copy_from_slice(&self.chunks[ci][off..off + take]);
+            read += take;
+        }
+        read_size
+    }
+}
+
 #[derive(Debug)]
 enum TmpFileData {
     Directory(TmpDir),
-    File(Vec<u8>),
+    File(ChunkedFile),
     Device(Arc<dyn Device>),
     // TODO: support symlink
     // SymLink(String),
@@ -176,7 +274,7 @@ impl TmpInode {
         Arc::new_cyclic(|weak_inode| Self {
             inner: RwLock::new(InnerNode {
                 attr: InodeAttr::new(inode_no, InodeFileType::Regular, mode, uid, gid, 0),
-                data: TmpFileData::File(Vec::new()),
+                data: TmpFileData::File(ChunkedFile::new()),
             }),
             this: weak_inode.clone(),
             fs: fs.clone(),
@@ -287,14 +385,14 @@ impl InnerNode {
         }
     }
 
-    fn as_file(&self) -> Option<&Vec<u8>> {
+    fn as_file(&self) -> Option<&ChunkedFile> {
         match &self.data {
             TmpFileData::File(file) => Some(file),
             _ => None,
         }
     }
 
-    fn as_file_mut(&mut self) -> Option<&mut Vec<u8>> {
+    fn as_file_mut(&mut self) -> Option<&mut ChunkedFile> {
         match &mut self.data {
             TmpFileData::File(file) => Some(file),
             _ => None,
@@ -431,11 +529,7 @@ impl InodeOps for TmpInode {
             return Err(code::EISDIR);
         };
         debug_assert!(data.len() == inner.attr.size);
-        let file_size = inner.attr.size;
-        let read_pos = file_size.min(offset);
-        let read_end = file_size.min(offset + buf.len());
-        let read_size = read_end - read_pos;
-        buf[..read_size].copy_from_slice(&data[read_pos..read_end]);
+        let read_size = data.read_at(offset, buf);
 
         Ok(read_size)
     }
@@ -458,13 +552,11 @@ impl InodeOps for TmpInode {
             };
 
             need_resize = write_end > file_size;
-            if need_resize {
-                data.resize(write_end, 0);
-            }
-            data[offset..write_end].copy_from_slice(buf);
+            data.write_at(offset, buf);
         }
         if need_resize {
             inner.attr.size = write_end;
+            inner.attr.blocks = inner.attr.size.div_ceil(BLOCK_SIZE);
         }
 
         Ok(buf.len())
@@ -635,8 +727,9 @@ impl InodeOps for TmpInode {
             warn!("resize: inode is not a file");
             return Err(code::EISDIR);
         };
-        data.resize(size, 0);
+        data.resize(size);
         inner.attr.size = size;
+        inner.attr.blocks = size.div_ceil(BLOCK_SIZE);
         Ok(())
     }
 
